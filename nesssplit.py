@@ -1,7 +1,13 @@
+#!/usr/bin/env python3
+
 from scipy import signal, stats
 from scipy.io import wavfile
-from scipy.interpolate import interp1d
+import argparse
+import datetime as dt
+import logging as log
 import numpy as np
+import presets
+import sys
 
 '''Complex number conversions'''
 
@@ -63,6 +69,10 @@ def chisquare(xs, sample_size):
     # take a rolling chisquare stat
     return stats.chisquare(xs_rolling_hist, axis=-1).pvalue
 
+def stdout_print(string):
+    sys.stdout.write(f'{string:<40}' + '\r')
+    sys.stdout.flush()
+
 class NoiseSplitter(object):
     def __init__(self, nffts, bin_ranges, chisquare_sample_sizes, overlap, pvalue_mask_func, window):
         self.nffts = nffts
@@ -74,7 +84,7 @@ class NoiseSplitter(object):
         
     def split_noise_band(self, nfft, bin_range, chisquare_sample_size, normalized_input_data, rate, mix_bus):
         noverlap = (self.overlap - 1) * nfft // self.overlap
-        print(f'\tTaking STFT: nperseg={nfft}, noverlap={noverlap}')
+        stdout_print(f'Taking STFT: nperseg={nfft}, noverlap={noverlap}')
         f, t, Zxx = signal.stft(normalized_input_data, rate, nperseg=nfft, noverlap=noverlap, window=self.window)
         Zxx_mag, Zxx_phase = r2p(Zxx)
 
@@ -83,32 +93,32 @@ class NoiseSplitter(object):
         Zxx_phase_bandpass = Zxx_phase[low_bin:high_bin,:]
         
         # Unwrap phases
-        print('\tDoing phase things')
+        stdout_print('Doing phase things')
         Zxx_phase_unwrapped = np.unwrap(Zxx_phase_bandpass)
         Zxx_phase_unwrapped_diffs = np.diff(Zxx_phase_unwrapped, 1)
 
-        # Run the chi-squared test on the unwrapped phase differences 
-        print('\tRunning the chi-squared test')
+        # Run the chi-squared test on the unwrapped phase differences
+        stdout_print('Running the chi-squared test')
         chisquare_curried = lambda xs: chisquare(xs, chisquare_sample_size)
         p_values = np.apply_along_axis(chisquare_curried, -1, Zxx_phase_unwrapped_diffs)
 
         # use the p values to mask any sounds within a certain range of noisiness
-        print(f'\tApplying masking function')
+        stdout_print('Applying masking function')
         mask = self.pvalue_mask_func(p_values)
 
         # Pad the mask to preserve the original shape
-        print('\tPadding mask')
+        stdout_print('Padding mask')
         mask_padded = np.zeros(Zxx.shape)
         end_pad = chisquare_sample_size // 2
         start_pad = chisquare_sample_size - end_pad
         mask_padded[low_bin:high_bin,start_pad:-end_pad] = mask
 
         # apply mask
-        print('\tApplying mask')
+        stdout_print('Applying mask')
         Zxx_masked = p2r(Zxx_mag*mask_padded, Zxx_phase)
         
         # take the ISTFT
-        print('\tTaking ISTFT')
+        stdout_print('Taking ISTFT')
         t_masked, x_masked = signal.istft(Zxx_masked, rate, nperseg=nfft, noverlap=noverlap, window=self.window)
         
         if len(mix_bus) < len(x_masked):
@@ -121,87 +131,63 @@ class NoiseSplitter(object):
         return mix_bus_out
 
     def split_noise(self, input_file_path, output_file_path):
-        # Read an audio file
-        print(f'Loading audio file {input_file_path}')
         input_sample_rate, raw_input_data = wavfile.read(input_file_path)
         n_input_frames, n_channels = raw_input_data.shape
         input_dtype = raw_input_data.dtype
-        print(f'Input channels: {n_channels}')
-        print(f'Input frames: {n_input_frames}')
-        print(f'Input sample type: {input_dtype}')
-        print(f'Input sample rate: {input_sample_rate}')
-        # TODO: handle float input
+        log.debug(f'Input channels: {n_channels}')
+        log.debug(f'Input frames: {n_input_frames}')
+        log.debug(f'Input sample type: {input_dtype}')
+        log.debug(f'Input sample rate: {input_sample_rate}')
         max_dtype_val = np.iinfo(input_dtype).max
         normalized_input_data = raw_input_data / max_dtype_val
         output = []
         for channel in range(n_channels):
+            log.info(f'Processing channel {channel+1}')
             input_channel = normalized_input_data[:, channel]
             mix_bus = np.zeros(len(raw_input_data), dtype='float64')
             analysis_args = zip(self.nffts, self.bin_ranges, self.chisquare_sample_sizes)
             for nfft, bin_range, chisquare_sample_size in analysis_args:
-                print(f'nfft: {nfft}; bin_range: {bin_range}; chisquare sample size: {chisquare_sample_size}; ')
+                log.debug(f'nfft: {nfft}; bin_range: {bin_range}; chisquare sample size: {chisquare_sample_size}; overlap: {self.overlap}')
                 mix_bus = self.split_noise_band(nfft, bin_range, chisquare_sample_size, input_channel, input_sample_rate, mix_bus)
             output.append(mix_bus)
         # write audio
-        print(f'Writing audio file {output_file_path}')
+        log.debug(f'Writing audio file {output_file_path}')
         audio_array = np.int16(np.array(output).T * max_dtype_val)
         wavfile.write(output_file_path, input_sample_rate, audio_array)
 
+DEFAULT_PRESET = 'sparkle'
 
-'''Settings'''
-
-# sparkle settings (good for timestretches of pop music)
-xs_sparkle, ys_sparkle = zip((0, 1), (1e-7, 1), (1.001e-7, 0), (1, 0))
-pvalue_mask_func_sparkle = interp1d(xs_sparkle, ys_sparkle, kind='linear')
-nsp_sparkle_preset = NoiseSplitter(
-    nffts = [2048],
-    bin_ranges = [(0, 1025)],
-    chisquare_sample_sizes = [11],
-    overlap = 4,
-    pvalue_mask_func = pvalue_mask_func_sparkle,
-    window = 'hann')
-
-# layered sparkle settings (good for timestretches of noisy sounds)
-xs_sparkle2, ys_sparkle2 = zip((0, 1), (1e-7, 1), (1.001e-7, 0), (1, 0))
-pvalue_mask_func_sparkle2 = interp1d(xs_sparkle2, ys_sparkle2, kind='linear')
-nsp_sparkle2_preset = NoiseSplitter(
-    nffts = [8192, 4096, 2048, 1024, 512],
-    bin_ranges = [(0, 129), (65, 129), (65, 129), (65, 129), (65, 257)],
-    chisquare_sample_sizes = [11, 11, 21, 41, 81],
-    overlap = 4,
-    pvalue_mask_func = pvalue_mask_func_sparkle2,
-    window = 'hann')
-
-# tone settings
-xs_tone, ys_tone = zip((0, 1), (1e-9, 1), (1e-8, 0.5), (1e-7, 0.25), (1e-6, 0.125), (1e-5, 0), (1, 0))
-pvalue_mask_func_tone = interp1d(xs_tone, ys_tone, kind='linear')
-nsp_tone_preset = NoiseSplitter(
-    nffts = [8192, 4096, 2048],
-    # cut out the top two octaves
-    bin_ranges = [(0, 129), (65, 129), (65, 257)],
-    chisquare_sample_sizes = [21, 41, 81],
-    overlap = 4,
-    pvalue_mask_func = pvalue_mask_func_tone,
-    window = 'hann')
-
-# noise settings
-xs_noise, ys_noise = zip((0, 0), (0.001, 0), (0.01, 1), (1, 1))
-pvalue_mask_func_noise = interp1d(xs_noise, ys_noise, kind='linear')
-nsp_noise_preset = NoiseSplitter(
-    nffts = [8192, 4096, 2048, 1024, 512, 256],
-    bin_ranges = [(0, 129), (65, 129), (65, 129), (65, 129), (65, 129), (65, 129)],
-    chisquare_sample_sizes = [11, 11, 11, 11, 11, 11],
-    overlap = 4,
-    pvalue_mask_func = pvalue_mask_func_noise,
-    window = 'hann')
-
-filename = 'audio/bells/197861__bigben12345__kolner-dom-plenum'
-input_file_path = f'{filename}.wav'
-output_file_path_tone = f'{filename}_tone.wav'
-output_file_path_noise = f'{filename}_noise.wav'
-#nsp_tone_preset.split_noise(input_file_path, output_file_path_tone)
-#nsp_noise_preset.split_noise(input_file_path, output_file_path_noise)
-nsp_sparkle2_preset.split_noise(input_file_path, output_file_path_tone)
-
-# TODO: add a multifile export setting
-# TODO: write docs
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        'infile',
+        help='path to 16-bit wave source file')
+    parser.add_argument(
+        'outfile',
+        help='path to write output file')
+    parser.add_argument(
+        '-p', '--preset',
+        default=DEFAULT_PRESET,
+        help=f'preset to use, default is {DEFAULT_PRESET}')
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help=f'show debugging messages, default is False')
+    parser.add_argument(
+        '-l', '--log',
+        action='store_true',
+        help=f'write logging messages to a file, default is False')
+    args = parser.parse_args()
+    if args.verbose:
+        log_level=log.DEBUG
+    else:
+        log_level=log.INFO
+    if args.log:
+        now_str = dt.datetime.now().strftime('%Y%m%d%H%M%S')
+        log_filename = f'nesssplit_{now_str}.log'
+        log.basicConfig(filename=log_filename, level=log_level, format='%(asctime)s %(message)s')
+    else:
+        log.basicConfig(level=log_level, format='%(asctime)s %(message)s')
+    log.debug(f'Loading preset "{args.preset}"')
+    preset = presets.preset_dict[args.preset]
+    preset.split_noise(args.infile, args.outfile)
